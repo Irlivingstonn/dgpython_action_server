@@ -1,0 +1,596 @@
+/*#######################################################################
+# AdaptiveNDE Project                                                   #
+# AFRL-ROS Package                                                      # 
+#########################################################################
+# Copyright 2023-2024 University of Dayton                              #
+#                                                                       #
+# Redistribution and use in source and binary forms, with or without    # 
+# modification, are permitted provided that the following conditions    #
+# are met:                                                              #
+#                                                                       # 
+# 1. Redistributions of source code must retain the above copyright     #
+#    notice, this list of conditions and the following disclaimer.      #
+# 2. Redistributions in binary form must reproduce the above copyright  #
+#    notice, this list of conditions and the following disclaimer in    #
+#    the documentation and/or other materials provided with the         #
+#    distribution.                                                      #
+# 3. Neither the name of the copyright holder nor the names of its      #
+#    contributors may be used to endorse or promote products derived    #
+#    from this software without specific prior written permission.      #
+#                                                                       #
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS   #
+# “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT     #
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR #
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT  #
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,#
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT      #
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, #
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY #
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT   #
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE #
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  #
+#########################################################################
+# This material is based in part upon work supported by the U.S. Air    #
+# Force under Contract FA8650-19-D-5230.                                #
+#                                                                       #
+# DISTRIBUTION A. Approved for public release: distribution unlimited.  #
+#########################################################################
+# File:  dgpython_action_server.cpp                                                     
+# Authors: Tyler Lesthaeghe
+# Created: 2023-06-22                                                  
+# Description:
+#   Dataguzzler/MoveIt Bridge Implementation
+# Derived From:                                                         
+#   https://moveit.picknik.ai/main/index.html    
+#     under BSD 3-Clause License
+#########################################################################
+# Revision Log                                                          
+# 
+# 2023-06-22:  Initial Commit
+# 2023-11-06:  Added Stop on Failure
+# 2023-11-14:  Debugging Statements
+# 
+#########################################################################
+# Development Notes
+#
+#
+#######################################################################*/
+
+#include <functional>
+#include <memory>
+#include <thread>
+#include <string>
+#include <limits>
+
+#include <sstream> // added temp to debug
+
+#include <cstdio> 
+
+#include "dgpython_ros2_actioninterface/action/dg_python.hpp"
+#include <rclcpp/rclcpp.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#include <geometry_msgs/msg/pose.hpp>
+#include <geometry_msgs/msg/point.hpp>
+#include <visualization_msgs/msg/marker.hpp>
+#include <shape_msgs/msg/mesh.hpp>
+#include <shape_msgs/msg/mesh_triangle.hpp>
+#include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/robot_model/robot_model.h>
+#include <moveit/robot_model_loader/robot_model_loader.h>
+#include <moveit/planning_scene_interface/planning_scene_interface.h>
+#include <moveit_msgs/msg/collision_object.hpp>
+#include <moveit_msgs/msg/move_it_error_codes.hpp>
+#include <moveit_msgs/msg/robot_trajectory.hpp>
+#include <moveit_msgs/msg/robot_state.hpp>
+
+#include "dgpython_ros2_actionserver/visibility_control.h"
+#include <boost/lexical_cast.hpp> // here for debugging
+namespace dgpython_ros2_actionserver
+{
+class DgPythonActionServer : public rclcpp::Node
+{
+public:
+  using DgPython = dgpython_ros2_actioninterface::action::DgPython;
+  using GoalHandleDgPython = rclcpp_action::ServerGoalHandle<DgPython>;
+
+  DGPYTHON_ROS2_ACTIONSERVER_PUBLIC
+  explicit DgPythonActionServer()
+    : Node("dgpython_action_server")
+  {
+      using namespace std::placeholders;
+      
+      mesh_sub_ = this->create_subscription<visualization_msgs::msg::Marker>(
+          "industrial_reconstruction_mesh", 10, std::bind(&DgPythonActionServer::mesh_callback, this, _1));
+          
+      this->action_server_ = rclcpp_action::create_server<DgPython>(
+          this,
+          "dgpython",
+          std::bind(&DgPythonActionServer::handle_goal, this, _1, _2),
+          std::bind(&DgPythonActionServer::handle_cancel, this, _1),
+          std::bind(&DgPythonActionServer::handle_accepted, this, _1));
+  }
+
+private:
+  rclcpp_action::Server<DgPython>::SharedPtr action_server_;
+  rclcpp::Subscription<visualization_msgs::msg::Marker>::SharedPtr mesh_sub_;
+  std::shared_ptr<moveit::planning_interface::MoveGroupInterface> move_group_interface_;
+  moveit::planning_interface::PlanningSceneInterface planning_scene_interface;
+  moveit_msgs::msg::CollisionObject collision_object;
+  shape_msgs::msg::Mesh collision_mesh_;
+
+  void mesh_callback(const visualization_msgs::msg::Marker& mesh)
+  {
+
+    RCLCPP_INFO(this->get_logger(), "Received idustrial reconstruction mesh");
+
+    // Convert points from marker to mesh vertices
+    collision_mesh_.vertices.clear();
+    for (const auto& point : mesh.points) {
+        geometry_msgs::msg::Point vertex;
+        vertex = point;  // Direct assignment of points
+        collision_mesh_.vertices.push_back(vertex);
+    }
+
+    // Create triangles from points (assuming points are arranged in triangles)
+    collision_mesh_.triangles.clear();
+    for (size_t i = 0; i < mesh.points.size(); i += 3) {
+        shape_msgs::msg::MeshTriangle triangle;
+        triangle.vertex_indices[0] = i;
+        triangle.vertex_indices[1] = i + 1;
+        triangle.vertex_indices[2] = i + 2;
+        collision_mesh_.triangles.push_back(triangle);
+    }
+
+    collision_object.meshes.push_back(collision_mesh_);
+    collision_object.mesh_poses.push_back(mesh.pose);
+    collision_object.operation = collision_object.ADD;
+    planning_scene_interface.applyCollisionObject(collision_object);
+
+    
+  }
+
+  rclcpp_action::GoalResponse handle_goal(
+    const rclcpp_action::GoalUUID & uuid,
+    std::shared_ptr<const DgPython::Goal> goal)
+  {
+    if(!goal->state.empty())
+    {
+      RCLCPP_INFO(this->get_logger(), "Received goal request with state (%s)", goal->state.c_str());
+      (void)uuid;
+      return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+    }
+    else if(!goal->pose_array.poses.empty())
+    {
+      RCLCPP_INFO(this->get_logger(), "Received goal request received pose array with %zu poses", goal->pose_array.poses.size());
+    }
+    else if(goal->destination.position.x != 0.0 && goal->destination.position.y != 0.0 && goal->destination.position.z != 0.0)
+    {
+      RCLCPP_INFO(this->get_logger(), "Received goal request with destination (%f, %f, %f)", goal->destination.position.x, goal->destination.position.y, goal->destination.position.z);
+    }
+    else
+    {
+      RCLCPP_INFO(this->get_logger(), "Received goal request with no goal");
+      return rclcpp_action::GoalResponse::REJECT;
+    }
+    
+    (void)uuid;
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+  }
+
+  rclcpp_action::CancelResponse handle_cancel(
+    const std::shared_ptr<GoalHandleDgPython> goal_handle)
+  {
+    RCLCPP_INFO(this->get_logger(), "Received request to cancel goal");
+    (void)goal_handle;
+    return rclcpp_action::CancelResponse::ACCEPT;
+  }
+
+  void handle_accepted(const std::shared_ptr<GoalHandleDgPython> goal_handle)
+  {
+    using namespace std::placeholders;
+    // this needs to return quickly to avoid blocking the executor, so spin up a new thread
+    std::thread{std::bind(&DgPythonActionServer::execute, this, _1), goal_handle}.detach();
+  }
+
+  void execute(const std::shared_ptr<GoalHandleDgPython> goal_handle)
+  {
+    RCLCPP_INFO(this->get_logger(), "Preparing to execute goal");
+    const auto goal = goal_handle->get_goal();
+    auto result = std::make_shared<DgPython::Result>();
+
+    if (!this->move_group_interface_) {
+    	this->move_group_interface_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(shared_from_this(), "arm");
+    	this->move_group_interface_->setGoalTolerance(0.0001);
+      this->move_group_interface_->setPoseReferenceFrame("world");  // Add this line
+    	RCLCPP_INFO(this->get_logger(), "Planning Frame: %s", this->move_group_interface_->getPlanningFrame().c_str());
+    	RCLCPP_INFO(this->get_logger(), "End Effector Link: %s", this->move_group_interface_->getEndEffectorLink().c_str());
+      //move_group_interface_->setPlanningFrame("table_3");
+    }
+    
+    // Add collision object check here
+    //auto collision_objects = planning_scene_interface.getObjects();
+    //RCLCPP_INFO(this->get_logger(), "Number of collision objects: %zu", collision_objects.size());
+
+    move_group_interface_->setMaxVelocityScalingFactor(goal->velocity);
+    move_group_interface_->setMaxAccelerationScalingFactor(goal->acceleration);
+    move_group_interface_->setPlanningTime(10.0);
+    if(!goal->state.empty()){ // If there's a goal state
+
+        // Retrieve the robot model
+        //const moveit::core::RobotModelPtr robot_model = move_group_interface_.getModel();
+        //if (!robot_model) {
+        //    RCLCPP_ERROR(this->get_logger(), "Failed to get robot model.");
+        //    return;
+        //}
+
+        // Get the named targets from the SRDF
+        //std::vector<std::string> named_targets;
+        //robot_model->getJointModelGroup("ur_manipulator")->getVariableNames(named_targets);
+      
+        //RCLCPP_INFO(this->get_logger(), "Available named targets:");
+        //for (const auto& target : named_targets) {
+        //    RCLCPP_INFO(this->get_logger(), "%s", target.c_str());
+        //}
+        moveit::planning_interface::MoveGroupInterface::Plan my_plan;
+        std::string target_name = goal->state;
+        move_group_interface_->setNamedTarget(target_name);
+        bool success = (move_group_interface_->plan(my_plan) == moveit::planning_interface::MoveItErrorCode::SUCCESS);
+        if (success) {
+            move_group_interface_->execute(my_plan);
+        } else {
+            RCLCPP_ERROR(this->get_logger(), "Planning failed for named target: %s", target_name.c_str());
+        }
+
+        if (rclcpp::ok()) {
+            // feedback->progress = 1.0;
+            result->success = true;
+            goal_handle->succeed(result);
+            RCLCPP_INFO(this->get_logger(), "Goal executed successfully");
+            return;
+        }
+    }
+    else if(!goal->pose_array.poses.empty()){
+
+      std::vector<geometry_msgs::msg::Pose> waypoints;
+      for (const auto& pose : goal->pose_array.poses) {
+            waypoints.push_back(pose);
+        }
+      RCLCPP_INFO(this->get_logger(), "Received %zu waypoints", waypoints.size());
+      moveit_msgs::msg::RobotTrajectory trajectory;
+      const double jump_threshold = 0.0;
+      const double eef_step = 0.01;
+      double fraction = this->move_group_interface_->computeCartesianPath(waypoints, eef_step, jump_threshold, trajectory);
+
+      if (goal_handle->is_canceling()) {
+          //result->sequence = sequence;
+          result->success = false;
+          goal_handle->canceled(result);
+  	      this->move_group_interface_->stop();
+          RCLCPP_INFO(this->get_logger(), "Goal canceled");
+          return;
+      }
+
+      moveit::core::MoveItErrorCode status;
+      if(fraction > 0 && (fraction - 1.0) <= std::numeric_limits<double>::epsilon() && rclcpp::ok()) {
+  			status = this->move_group_interface_->execute(trajectory);
+  		}
+  		else {
+   			this->move_group_interface_->stop();
+  		        result->success = false;
+  			goal_handle->abort(result);
+  			RCLCPP_ERROR(this->get_logger(), "Planning failed");
+        return;      
+  		}   
+
+      // Check if goal is done
+      if (rclcpp::ok() && status.val == moveit::core::MoveItErrorCode::SUCCESS) {
+        result->success = true;
+        goal_handle->succeed(result);
+        RCLCPP_INFO(this->get_logger(), "Goal succeeded");
+        return;
+      }
+      else {
+        this->move_group_interface_->stop();
+        result->success = false;
+        goal_handle->abort(result);
+        RCLCPP_ERROR(this->get_logger(), "Failed to reach goal, error code %d", status.val);
+        return;
+      }
+    }
+    else if(goal->destination.position.x != 0.0 && goal->destination.position.y != 0.0 && goal->destination.position.z != 0.0)
+    {
+      // Gets current pose of the robot
+      geometry_msgs::msg::PoseStamped current_pose = move_group_interface_->getCurrentPose();
+
+      //auto const target_pose = [&current_pose](geometry_msgs::msg::PoseStamped msg) {
+      //    geometry_msgs::msg::Pose out;
+      //    out.orientation.w = current_pose.pose.orientation.w;
+      //    out.orientation.x = current_pose.pose.orientation.x;
+      //    out.orientation.y = current_pose.pose.orientation.y;
+      //    out.orientation.z = current_pose.pose.orientation.z;
+      //    out.position.x = current_pose.pose.position.x;
+      //    out.position.y = current_pose.pose.position.y;
+      //    out.position.z = current_pose.pose.position.z;
+      //    return out;
+      //}(current_pose);
+
+      auto const target_pose = [](geometry_msgs::msg::Pose msg){
+    	    			geometry_msgs::msg::Pose out;
+  	 			out.orientation.w = msg.orientation.w;
+  				out.orientation.x = msg.orientation.x;
+  				out.orientation.y = msg.orientation.y;
+  				out.orientation.z = msg.orientation.z;
+  				out.position.x = msg.position.x;
+  				out.position.y = msg.position.y;
+  				out.position.z = msg.position.z;
+  				return out;
+  				}(goal->destination);
+
+
+      RCLCPP_INFO(this->get_logger(), "==============================================");
+
+      RCLCPP_INFO(this->get_logger(), "Goal Position: %f, %f, %f", goal->destination.position.x, goal->destination.position.y, goal->destination.position.z);
+      RCLCPP_INFO(this->get_logger(), "Current Robot Pose (Before Planning) - Position: %f, %f, %f", current_pose.pose.position.x, current_pose.pose.position.y, current_pose.pose.position.z);
+
+      RCLCPP_INFO(this->get_logger(), "==============================================");
+
+      // Sets the target pose of the robot
+      std::vector<geometry_msgs::msg::Pose> waypoints; 
+      waypoints.push_back(target_pose);
+      //RCLCPP_INFO(this->get_logger(), "TESTING STUFF HEREEEEEEEEEEe");
+
+      const int num_steps = 10;
+      //for (int i = 0; i <= num_steps; ++i) { // wanted to use this one
+      //    geometry_msgs::msg::Pose intermediate_pose = target_pose;
+      //    double fraction = static_cast<double>(i) / num_steps;
+      //    
+      //    intermediate_pose.position.x = current_pose.pose.position.x + 
+      //        fraction * (goal->destination.position.x - current_pose.pose.position.x);
+      //    intermediate_pose.position.y = current_pose.pose.position.y + 
+      //        fraction * (goal->destination.position.y - current_pose.pose.position.y);
+      //    intermediate_pose.position.z = current_pose.pose.position.z + 
+      //        fraction * (goal->destination.position.z - current_pose.pose.position.z);
+      //    
+      //    waypoints.push_back(intermediate_pose);
+      //}
+      
+      
+      
+      
+      
+      //for (int i = 0; i <= num_steps; ++i) {
+      //    geometry_msgs::msg::Pose intermediate_pose = target_pose;
+      //    double fraction = static_cast<double>(i) / num_steps;
+      //    RCLCPP_INFO(this->get_logger(), "Fraction: %f", fraction);
+//
+      //    intermediate_pose.position.x = current_pose.pose.position.x + 
+      //        fraction * (target_pose.position.x - current_pose.pose.position.x);
+      //    intermediate_pose.position.y = current_pose.pose.position.y + 
+      //        fraction * (target_pose.position.y - current_pose.pose.position.y);
+      //    intermediate_pose.position.z = current_pose.pose.position.z + 
+      //        fraction * (target_pose.position.z - current_pose.pose.position.z);
+      //    RCLCPP_INFO(this->get_logger(), "First Value: %f, %f, %f", intermediate_pose.position.x, intermediate_pose.position.y, intermediate_pose.position.z);
+      //    waypoints.push_back(intermediate_pose);
+      //}
+      
+      moveit_msgs::msg::RobotTrajectory trajectory; 
+      moveit_msgs::msg::MoveItErrorCodes error_code;
+      
+      const double jump_threshold = 0.05;
+      const double eef_step = 0.01;
+
+
+    
+
+
+      // =================== Configuring Planning parameters ===================
+      //RCLCPP_INFO(this->get_logger(), "Changed Max Velocity Scaling and Planner");
+      
+      move_group_interface_->setPlannerId("RRTConnectkConfigDefault");  // Use RRT planner
+      move_group_interface_->setMaxVelocityScalingFactor(0.1);  // Slower movement
+      move_group_interface_->setMaxAccelerationScalingFactor(0.2);  // Slower movement
+      move_group_interface_->setPlanningTime(10.0);
+      move_group_interface_->setNumPlanningAttempts(10);
+
+
+
+      // =================== Constraints ===================
+      //RCLCPP_INFO(this->get_logger(), "Added Constraints");
+
+      moveit_msgs::msg::Constraints pose_constraints;
+
+      // Position constraint
+      moveit_msgs::msg::PositionConstraint pos_constraint;
+      pos_constraint.header.frame_id = move_group_interface_->getPlanningFrame();
+      pos_constraint.link_name = move_group_interface_->getEndEffectorLink();
+      pos_constraint.target_point_offset.x = 0.0;
+      pos_constraint.target_point_offset.y = 0.0;
+      pos_constraint.target_point_offset.z = 0.0;
+
+      // Define position bounds
+      shape_msgs::msg::SolidPrimitive constraint_region;
+      constraint_region.type = shape_msgs::msg::SolidPrimitive::SPHERE;
+      constraint_region.dimensions = {0.01}; // 1cm tolerance sphere
+
+      pos_constraint.constraint_region.primitives.push_back(constraint_region);
+      pos_constraint.constraint_region.primitive_poses.push_back(target_pose);
+      pos_constraint.weight = 1.0;
+
+
+      // Orientation constraint
+      moveit_msgs::msg::OrientationConstraint orient_constraint;
+      orient_constraint.header.frame_id = move_group_interface_->getPlanningFrame();
+      orient_constraint.orientation = target_pose.orientation;
+      orient_constraint.link_name = move_group_interface_->getEndEffectorLink();
+      orient_constraint.absolute_x_axis_tolerance = 0.01;
+      orient_constraint.absolute_y_axis_tolerance = 0.01;
+      orient_constraint.absolute_z_axis_tolerance = 0.01;
+      orient_constraint.weight = 1.0;
+
+      pose_constraints.position_constraints.push_back(pos_constraint);
+      pose_constraints.orientation_constraints.push_back(orient_constraint);
+
+      move_group_interface_->setPathConstraints(pose_constraints);
+
+
+
+
+      
+
+      
+
+      
+
+      // Plans a trajectory to follow the waypoints
+      RCLCPP_INFO(this->get_logger(), "Planning now");
+      
+
+      double fraction = this->move_group_interface_->computeCartesianPath(
+          waypoints,
+          eef_step,
+          jump_threshold,  
+          trajectory,
+          true,  // avoid_collisions
+          &error_code
+      );
+      RCLCPP_INFO(this->get_logger(), "Visualizing plan 4 (Cartesian path) (%.2f%% achieved)", fraction * 100.0);
+      std::stringstream ss; // formatting
+      ss << fraction;
+  
+      RCLCPP_INFO(this->get_logger(), "Error code: %d", error_code.val);
+      RCLCPP_INFO(this->get_logger(),  ("Number of Fraction: " + std::to_string(fraction)).c_str());
+      
+      
+
+      // Gets current pose of the robot
+      current_pose = move_group_interface_->getCurrentPose();
+      //RCLCPP_INFO(this->get_logger(), "==============================================");
+
+      // Add these debug prints
+      //RCLCPP_INFO(this->get_logger(), "Planning attempt details:");
+      //RCLCPP_INFO(this->get_logger(), "- IK Solution Found: %s", 
+      //    (error_code.val == moveit_msgs::msg::MoveItErrorCodes::NO_IK_SOLUTION) ? "No" : "Yes");
+      //RCLCPP_INFO(this->get_logger(), "- Path Constraints Met: %s",
+      //    (error_code.val == moveit_msgs::msg::MoveItErrorCodes::GOAL_CONSTRAINTS_VIOLATED) ? "No" : "Yes");
+      //RCLCPP_INFO(this->get_logger(), "- Goal State Valid: %s",
+      //    (error_code.val == moveit_msgs::msg::MoveItErrorCodes::GOAL_STATE_INVALID) ? "No" : "Yes");
+      //RCLCPP_INFO(this->get_logger(), "Robot Start State Valid: %s", 
+      //  move_group_interface_->getCurrentState()->satisfiesBounds() ? "true" : "false");
+
+      //RCLCPP_INFO(this->get_logger(), "==============================================");
+      //RCLCPP_INFO(this->get_logger(), ("Size of Waypoints: " + std::to_string(waypoints.size())).c_str());
+      //RCLCPP_INFO(this->get_logger(),  ("Number of eef_step: " + std::to_string(eef_step)).c_str());
+      //RCLCPP_INFO(this->get_logger(), ("Number of eef_step: " + std::to_string(jump_threshold)).c_str());
+      //RCLCPP_INFO(this->get_logger(), "==============================================");
+      //RCLCPP_INFO(this->get_logger(), "Target Pose - Position: %f, %f, %f, Orientation: %f, %f, %f, %f",
+      //  waypoints[0].position.x, waypoints[0].position.y, waypoints[0].position.z,
+      //  waypoints[0].orientation.x, waypoints[0].orientation.y, waypoints[0].orientation.z, waypoints[0].orientation.w);
+
+
+      //RCLCPP_INFO(this->get_logger(), "Current Position: %f, %f, %f", transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z);
+      RCLCPP_INFO(this->get_logger(), "Current Robot Pose (After Planning) - Position: %f, %f, %f", 
+          current_pose.pose.position.x,
+          current_pose.pose.position.y,
+          current_pose.pose.position.z);
+
+      //RCLCPP_INFO(this->get_logger(), "==============================================");
+      //RCLCPP_INFO(this->get_logger(), "Trajectory Points: %zu", trajectory.joint_trajectory.points.size());
+      //RCLCPP_INFO(this->get_logger(), "Planning Scene State:");
+      //RCLCPP_INFO(this->get_logger(), "- Reference Frame: %s", move_group_interface_->getPlanningFrame().c_str());
+      //RCLCPP_INFO(this->get_logger(), "- Planning Time: %f", move_group_interface_->getPlanningTime());
+      //auto path_constraints = move_group_interface_->getPathConstraints();
+      //RCLCPP_INFO(this->get_logger(), "Path Constraints Active: %s", 
+      //    (!path_constraints.position_constraints.empty() || !path_constraints.orientation_constraints.empty()) ? "Yes" : "No");
+
+      //RCLCPP_INFO(this->get_logger(), "==============================================");
+      //RCLCPP_INFO(this->get_logger(), "Setting fraction to 1.0");
+      //fraction = 1.0;
+
+
+
+
+
+      
+
+      
+
+
+      
+      
+      
+
+      
+      
+      //RCLCPP_INFO(this->get_logger(), trajectory.joint_trajectory.points.size());
+
+      RCLCPP_INFO(this->get_logger(), "Finished going through planning");
+
+      if (goal_handle->is_canceling()) {
+          //result->sequence = sequence;
+          result->success = false;
+          goal_handle->canceled(result);
+  	      this->move_group_interface_->stop();
+          RCLCPP_INFO(this->get_logger(), "Goal canceled");
+          return;
+      }
+
+      moveit::core::MoveItErrorCode status;
+      //if(fraction < 1.0) {
+      //    // Try regular motion planning instead
+      //    move_group_interface_->setPoseTarget(target_pose);
+      //    moveit::planning_interface::MoveGroupInterface::Plan my_plan;
+      //    bool success = (move_group_interface_->plan(my_plan) == moveit::planning_interface::MoveItErrorCode::SUCCESS);
+      //    if(success) {
+      //        status = move_group_interface_->execute(my_plan);
+      //    }
+      //}
+      
+      if(fraction > 0 && (fraction - 1.0) <= std::numeric_limits<double>::epsilon() && rclcpp::ok()) {
+  			status = this->move_group_interface_->execute(trajectory);
+  		}
+  		else {
+   			this->move_group_interface_->stop();
+  		        result->success = false;
+  			goal_handle->abort(result);
+  			RCLCPP_ERROR(this->get_logger(), "Planning failed");
+        return;      
+  		}   
+
+      // Check if goal is done
+      if (rclcpp::ok() && status.val == moveit::core::MoveItErrorCode::SUCCESS) {
+        result->success = true;
+        goal_handle->succeed(result);
+        RCLCPP_INFO(this->get_logger(), "Goal succeeded");
+        return;
+      }
+      else {
+        this->move_group_interface_->stop();
+        result->success = false;
+        goal_handle->abort(result);
+        RCLCPP_ERROR(this->get_logger(), "Failed to reach goal, error code %d", status.val);
+        return;
+      }
+
+    }
+    else
+    {
+      RCLCPP_ERROR(this->get_logger(), "Invalid goal");
+      result->success = false;
+      goal_handle->abort(result);
+      return;
+    }
+  }
+};  // class DgPythonActionServer
+
+}  // namespace dgpython_ros2_actionserver
+
+int main(int argc, char ** argv)
+{
+	rclcpp::init(argc, argv);
+	rclcpp::spin(std::make_shared<dgpython_ros2_actionserver::DgPythonActionServer>());
+	rclcpp::shutdown();	
+	return 0;
+}
+
